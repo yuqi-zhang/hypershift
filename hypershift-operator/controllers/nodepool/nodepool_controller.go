@@ -76,12 +76,13 @@ type NodePoolReconciler struct {
 	client.Client
 	recorder        record.EventRecorder
 	ReleaseProvider releaseinfo.Provider
-
+	controller      controller.Controller
+	remoteCaches    map[client.ObjectKey]bool
 	upsert.CreateOrUpdateProvider
 }
 
 func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	_, err := ctrl.NewControllerManagedBy(mgr).
+	controller, err := ctrl.NewControllerManagedBy(mgr).
 		For(&hyperv1.NodePool{}).
 		// We want to reconcile when the HostedCluster IgnitionEndpoint is available.
 		Watches(&source.Kind{Type: &hyperv1.HostedCluster{}}, handler.EnqueueRequestsFromMapFunc(r.enqueueNodePoolsForHostedCluster)).
@@ -102,6 +103,7 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return errors.Wrap(err, "failed setting up with a controller manager")
 	}
 
+	r.controller = controller
 	r.recorder = mgr.GetEventRecorderFor("nodepool-controller")
 
 	return nil
@@ -514,20 +516,44 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		log.Info("Reconciled Machine template", "result", result)
 	}
 
-	md := machineDeployment(nodePool, infraID, controlPlaneNamespace)
-	if result, err := controllerutil.CreateOrPatch(ctx, r.Client, md, func() error {
-		return r.reconcileMachineDeployment(
-			log,
-			md, nodePool,
-			userDataSecret,
-			template,
-			infraID,
-			targetVersion, targetConfigHash, targetConfigVersionHash, machineTemplateSpecJSON)
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to reconcile MachineDeployment %q: %w",
-			client.ObjectKeyFromObject(md).String(), err)
-	} else {
-		log.Info("Reconciled MachineDeployment", "result", result)
+	if nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		ms := machineSet(nodePool, infraID, controlPlaneNamespace)
+		if result, err := controllerutil.CreateOrPatch(ctx, r.Client, ms, func() error {
+			return r.reconcileMachineSet(
+				ctx,
+				ms, hcluster, nodePool,
+				userDataSecret,
+				template,
+				infraID,
+				targetVersion, targetConfigHash, targetConfigVersionHash, machineTemplateSpecJSON)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile MachineDeployment %q: %w",
+				client.ObjectKeyFromObject(ms).String(), err)
+		} else {
+			log.Info("Reconciled MachineSet", "result", result)
+		}
+
+		if err := r.reconcileInPlaceUpgrade(ctx, hcluster, nodePool, ms, targetConfigHash, targetVersion, targetConfigVersionHash); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeReplace {
+		md := machineDeployment(nodePool, infraID, controlPlaneNamespace)
+		if result, err := controllerutil.CreateOrPatch(ctx, r.Client, md, func() error {
+			return r.reconcileMachineDeployment(
+				log,
+				md, nodePool,
+				userDataSecret,
+				template,
+				infraID,
+				targetVersion, targetConfigHash, targetConfigVersionHash, machineTemplateSpecJSON)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to reconcile MachineDeployment %q: %w",
+				client.ObjectKeyFromObject(md).String(), err)
+		} else {
+			log.Info("Reconciled MachineDeployment", "result", result)
+		}
 	}
 
 	mhc := machineHealthCheck(nodePool, controlPlaneNamespace)
@@ -587,6 +613,27 @@ func deleteMachineDeployment(ctx context.Context, c client.Client, md *capiv1.Ma
 	return nil
 }
 
+func deleteMachineSet(ctx context.Context, c client.Client, ms *capiv1.MachineSet) error {
+	err := c.Get(ctx, client.ObjectKeyFromObject(ms), ms)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("error getting MachineDeployment: %w", err)
+	}
+	if ms.DeletionTimestamp != nil {
+		return nil
+	}
+	err = c.Delete(ctx, ms)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("error deleting MachineDeployment: %w", err)
+	}
+	return nil
+}
+
 func deleteMachineHealthCheck(ctx context.Context, c client.Client, mhc *capiv1.MachineHealthCheck) error {
 	err := c.Get(ctx, client.ObjectKeyFromObject(mhc), mhc)
 	if err != nil {
@@ -609,7 +656,9 @@ func deleteMachineHealthCheck(ctx context.Context, c client.Client, mhc *capiv1.
 }
 
 func (r *NodePoolReconciler) delete(ctx context.Context, nodePool *hyperv1.NodePool, infraID, controlPlaneNamespace string) error {
+	r.remoteCaches[client.ObjectKeyFromObject(nodePool)] = false
 	md := machineDeployment(nodePool, infraID, controlPlaneNamespace)
+	ms := machineSet(nodePool, infraID, controlPlaneNamespace)
 	mhc := machineHealthCheck(nodePool, controlPlaneNamespace)
 	machineTemplates, err := r.listMachineTemplates(nodePool)
 	if err != nil {
@@ -633,6 +682,10 @@ func (r *NodePoolReconciler) delete(ctx context.Context, nodePool *hyperv1.NodeP
 	}
 
 	if err := deleteMachineDeployment(ctx, r.Client, md); err != nil {
+		return fmt.Errorf("failed to delete MachineDeployment: %w", err)
+	}
+
+	if err := deleteMachineSet(ctx, r.Client, ms); err != nil {
 		return fmt.Errorf("failed to delete MachineDeployment: %w", err)
 	}
 
@@ -995,10 +1048,14 @@ func (r *NodePoolReconciler) getConfig(ctx context.Context, nodePool *hyperv1.No
 // prevent this from ever fail.
 func validateManagement(nodePool *hyperv1.NodePool) error {
 	// Only upgradeType "Replace" is supported atm.
-	if nodePool.Spec.Management.UpgradeType != hyperv1.UpgradeTypeReplace ||
-		nodePool.Spec.Management.Replace == nil {
-		return fmt.Errorf("this is unsupported. %q upgrade type and a strategy: %q or %q are required",
-			hyperv1.UpgradeTypeReplace, hyperv1.UpgradeStrategyRollingUpdate, hyperv1.UpgradeStrategyOnDelete)
+	//if nodePool.Spec.Management.UpgradeType != hyperv1.UpgradeTypeReplace ||
+	//	nodePool.Spec.Management.Replace == nil {
+	//	return fmt.Errorf("this is unsupported. %q upgrade type and a strategy: %q or %q are required",
+	//		hyperv1.UpgradeTypeReplace, hyperv1.UpgradeStrategyRollingUpdate, hyperv1.UpgradeStrategyOnDelete)
+	//}
+
+	if nodePool.Spec.Management.UpgradeType == hyperv1.UpgradeTypeInPlace {
+		return nil
 	}
 
 	if nodePool.Spec.Management.Replace.Strategy != hyperv1.UpgradeStrategyRollingUpdate &&

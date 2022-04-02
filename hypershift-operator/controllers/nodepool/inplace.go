@@ -8,14 +8,30 @@ import (
 	api "github.com/openshift/hypershift/api"
 	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/pointer"
 	k8sutilspointer "k8s.io/utils/pointer"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+const (
+	// MachineConfigDaemonStateAnnotationKey is used to fetch the state of the daemon on the machine.
+	MachineConfigDaemonStateAnnotationKey = "machineconfiguration.openshift.io/state"
+	// MachineConfigDaemonStateWorking is set by daemon when it is applying an update.
+	MachineConfigDaemonStateWorking = "Working"
+	// MachineConfigDaemonStateDone is set by daemon when it is done applying an update.
+	MachineConfigDaemonStateDone = "Done"
+	// MachineConfigDaemonStateDegraded is set by daemon when an error not caused by a bad MachineConfig
+	// is thrown during an update.
+	MachineConfigDaemonStateDegraded = "Degraded"
 )
 
 // reconcileInPlaceUpgrade loops over all Nodes that belong to a NodePool and performs and upgrade if necessary.
@@ -68,7 +84,235 @@ func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hy
 	// Check maxUnavailable/MaxSurge.
 	// Create Namespace/RBAC/ConfigMap/Pod in guest cluster.
 	// Mark Node as Upgrading.
+
+	// Testing: start the upgrade if we are not at version
+	if nodePool.Status.Version == targetVersion && nodePool.Annotations[nodePoolAnnotationCurrentConfig] == targetConfigHash {
+		log.Info("In inplace upgrade path, no update required.")
+		return nil
+	}
+
+	ready, err := createInPlaceUpdateManifests(ctx, remoteClient)
+	if err != nil {
+		return fmt.Errorf("failed to create update manifests in hosted cluster: %v", err)
+	}
+	if !ready {
+		// wait for next sync
+		log.Info("Manifests completed successfully, waiting for configmap.")
+		return nil
+	}
+
+	// TODO: need to pre-set each node's annotation to see if they are atversion/updating/updated
+	// For now just pick 1 if nobody is in progress
+	var inProgressNode string
+	for _, node := range nodes {
+		if node.Annotations[MachineConfigDaemonStateAnnotationKey] == MachineConfigDaemonStateWorking {
+			inProgressNode = node.Name
+			break
+		}
+	}
+	if inProgressNode != "" {
+		log.Info("Existing node in progress ", inProgressNode, " waiting for next sync")
+		return nil
+	}
+
+	// TODO hack to test workflow
+	err = setUpdatePodForNode(ctx, remoteClient, nodes[0].Name)
+	if err != nil {
+		return fmt.Errorf("failed to create update pod in hosted cluster for node %s: %v", nodes[0].Name, err)
+	}
+
+	err = setNodeWorking(ctx, remoteClient, nodes[0].Name)
+
 	return nil
+}
+
+func setNodeWorking(ctx context.Context, remoteClient client.Client, nodeName string) error {
+	// TODO set node status
+	return nil
+}
+
+func setUpdatePodForNode(ctx context.Context, remoteClient client.Client, nodeName string) error {
+	pod := &corev1.Pod{}
+	pod.APIVersion = corev1.SchemeGroupVersion.String()
+	pod.Kind = "Pod"
+	pod.Name = "machine-config-daemon-hypershift"
+	pod.Namespace = "hypershift-mco"
+	pod.Spec.Containers = []corev1.Container{
+		{
+			Name:  "machine-config-daemon",
+			Image: "quay.io/jerzhang/hypershiftdaemon:latest",
+			Command: []string{
+				"/usr/bin/machine-config-daemon",
+			},
+			Args: []string{
+				"start",
+				"--node-name=" + nodeName,
+				"--root-mount=/rootfs",
+				"--hypershift=desired-config",
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name: "POD_NAME",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.name",
+						},
+					},
+				},
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			SecurityContext: &corev1.SecurityContext{
+				Privileged: pointer.BoolPtr(true),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "rootfs",
+					MountPath: "/rootfs",
+				},
+			},
+		},
+	}
+	pod.Spec.HostNetwork = true
+	pod.Spec.HostPID = true
+	pod.Spec.ServiceAccountName = "machine-config-daemon-hypershift"
+	pod.Spec.Tolerations = []corev1.Toleration{
+		{
+			Operator: corev1.TolerationOpExists,
+		},
+	}
+	pod.Spec.Volumes = []corev1.Volume{
+		{
+			Name: "rootfs",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/",
+				},
+			},
+		},
+	}
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, pod, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update pod: %v", err)
+	}
+	return nil
+}
+
+func createInPlaceUpdateManifests(ctx context.Context, remoteClient client.Client) (bool, error) {
+	namespace := "hypershift-mco"
+	ns := &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Namespace",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, ns, nil); err != nil {
+		return false, fmt.Errorf("failed to reconcile update namespace: %v", err)
+	}
+
+	saName := "machine-config-daemon-hypershift"
+	sa := &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ServiceAccount",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      saName,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, sa, nil); err != nil {
+		return false, fmt.Errorf("failed to reconcile update serviceaccount: %v", err)
+	}
+
+	roleName := "machine-config-daemon-hypershift"
+	role := &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRole",
+			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      roleName,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+				Verbs:     []string{"get", "list", "watch", "patch", "update"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods/eviction"},
+				Verbs:     []string{"create"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"extensions"},
+				Resources: []string{"daemonsets"},
+				Verbs:     []string{"get"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"daemonsets"},
+				Verbs:     []string{"get"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"configmaps"},
+				Verbs:     []string{"get"},
+			},
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, role, nil); err != nil {
+		return false, fmt.Errorf("failed to reconcile update clusterrole: %v", err)
+	}
+
+	binding := &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRoleBinding",
+			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      roleName,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: namespace,
+			},
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, binding, nil); err != nil {
+		return false, fmt.Errorf("failed to reconcile update clusterrolebinding: %v", err)
+	}
+
+	// TODO fetch configuration from ignition-server controller. For now just do nothing if the expected configmap is not created.
+	configmap := &corev1.ConfigMap{}
+	if err := remoteClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "desired-config"}, configmap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to reconcile update configmap: %v", err)
+	}
+	return true, nil
 }
 
 func getNodesForNodePool(ctx context.Context, c client.Reader, remoteClient client.Client, machineSet *capiv1.MachineSet) ([]*corev1.Node, error) {

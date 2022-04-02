@@ -215,6 +215,17 @@ func (r *TokenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, fmt.Errorf("error getting ignition payload: %v", err)
 	}
 
+	// // Testing: stuff the payload into a configmap for the MCD-update to use
+	// testingCM := &corev1.ConfigMap{
+	// 	ObjectMeta: metav1.ObjectMeta{
+	// 		Name:      "desired-config",
+	// 		Namespace: "",
+	// 	},
+	// 	Data: map[string]string{
+	// 		"config": string(payload),
+	// 	},
+	// },
+
 	log.Info("IgnitionProvider generated payload")
 	r.PayloadStore.Set(token, CacheValue{Payload: payload, SecretName: tokenSecret.Name})
 	oldToken, ok := tokenSecret.Data[TokenSecretOldTokenKey]

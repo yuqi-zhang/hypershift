@@ -2,29 +2,55 @@ package nodepool
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"strconv"
+	"time"
 
 	api "github.com/openshift/hypershift/api"
 	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
 	hyperutil "github.com/openshift/hypershift/hypershift-operator/controllers/util"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/pointer"
 	k8sutilspointer "k8s.io/utils/pointer"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
+const (
+	// CurrentMachineConfigAnnotationKey is used to fetch current targetConfigVersionHash
+	CurrentMachineConfigAnnotationKey = "machineconfiguration.openshift.io/currentConfig"
+	// MachineConfigDaemonStateAnnotationKey is used to fetch the state of the daemon on the machine.
+	MachineConfigDaemonStateAnnotationKey = "machineconfiguration.openshift.io/state"
+	// MachineConfigDaemonStateWorking is set by daemon when it is applying an update.
+	MachineConfigDaemonStateWorking = "Working"
+	// MachineConfigDaemonStateDone is set by daemon when it is done applying an update.
+	MachineConfigDaemonStateDone = "Done"
+	// MachineConfigDaemonStateDegraded is set by daemon when an error not caused by a bad MachineConfig
+	// is thrown during an update.
+	MachineConfigDaemonStateDegraded = "Degraded"
+	// MachineConfigDaemonReasonAnnotationKey is set by the daemon when it needs to report a human readable reason for its state. E.g. when state flips to degraded/unreconcilable.
+	MachineConfigDaemonReasonAnnotationKey = "machineconfiguration.openshift.io/reason"
+)
+
 // reconcileInPlaceUpgrade loops over all Nodes that belong to a NodePool and performs and upgrade if necessary.
-func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hyperv1.HostedCluster, nodePool *hyperv1.NodePool, machineSet *capiv1.MachineSet, targetConfigHash, targetVersion, targetConfigVersionHash string) error {
+func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hyperv1.HostedCluster, nodePool *hyperv1.NodePool, machineSet *capiv1.MachineSet, targetConfigHash, targetVersion, targetConfigVersionHash, ignEndpoint string, caCertBytes, tokenBytes []byte) error {
 	log := ctrl.LoggerFrom(ctx)
 
 	// If there's no guest cluster yet return early.
@@ -76,8 +102,18 @@ func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hy
 		log.Info("Processing", "node", node.Name)
 	}
 
+	// TODO drop maybe?
+	// Since nothing is technically writing the configHash of each node before the first update,
+	// We may need to have the nodepool sync stop here if no update is needed
+	if nodePool.Annotations[nodePoolAnnotationCurrentConfigVersion] == targetConfigVersionHash {
+		log.Info("Inplace upgrade nodepool at desired version. No action required.")
+		return nil
+	}
+
 	// If all Nodes are atVersion
 	if inPlaceUpgradeComplete(nodes, targetConfigVersionHash) {
+		// TODO remove update manifests
+		// Keeping them around for now for logging purposes
 		if nodePool.Status.Version != targetVersion {
 			log.Info("Version update complete",
 				"previous", nodePool.Status.Version, "new", targetVersion)
@@ -103,6 +139,338 @@ func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hy
 	// Drain.
 	// Create Namespace/RBAC/ConfigMap/Pod in guest cluster.
 	// Mark Node as Upgrading.
+
+	err = createInPlaceUpdateManifests(ctx, remoteClient, targetConfigVersionHash, ignEndpoint, caCertBytes, tokenBytes)
+	if err != nil {
+		return fmt.Errorf("failed to create update manifests in hosted cluster: %v", err)
+	}
+
+	// First check if a node is degraded
+	// TODO I think we don't need to set non-degraded conditions since the next sync will overwrite this
+	for _, node := range nodes {
+		if node.Annotations[MachineConfigDaemonStateAnnotationKey] == MachineConfigDaemonStateDegraded {
+			setStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+				Type:               hyperv1.NodePoolUpdatingVersionConditionType,
+				Status:             corev1.ConditionFalse,
+				Reason:             hyperv1.NodePoolInplaceUpgradeFailedConditionReason,
+				Message:            fmt.Sprintf("Node %s in nodepool degraded: %v", node.Name, node.Annotations[MachineConfigDaemonReasonAnnotationKey]),
+				ObservedGeneration: nodePool.Generation,
+			})
+			return fmt.Errorf("degraded node found! Cannot continue")
+		}
+	}
+
+	// Then see if any nodes are already updating
+	// TODO have logic for maxUnavailable, etc.
+	var inProgressNode string
+	for _, node := range nodes {
+		if node.Annotations[MachineConfigDaemonStateAnnotationKey] == MachineConfigDaemonStateWorking {
+			inProgressNode = node.Name
+			break
+		}
+	}
+	if inProgressNode != "" {
+		log.Info("Existing node in progress ", inProgressNode, " waiting for next sync")
+		return nil
+	}
+
+	// TODO drain logic should go here
+	// Find a node that is not updated
+	var updateCandidateNode *corev1.Node
+	for _, node := range nodes {
+		if node.Annotations[CurrentMachineConfigAnnotationKey] != targetConfigVersionHash {
+			updateCandidateNode = node
+			break
+		}
+	}
+	if updateCandidateNode == nil {
+		return fmt.Errorf("no node available to be upgraded")
+	}
+
+	err = setUpdatePodForNode(ctx, remoteClient, updateCandidateNode, targetConfigVersionHash)
+	if err != nil {
+		return fmt.Errorf("failed to create update pod in hosted cluster for node %s: %v", updateCandidateNode, err)
+	}
+	return nil
+}
+
+func setNodeWorking(ctx context.Context, remoteClient client.Client, node *corev1.Node) error {
+	// TODO set node status
+	// This probably needs a design, namely, who writes what conditions (setworking/done/degraded vs currentconfig annotation)
+	// To ensure we never deadlock ourself waiting for a completed update, etc.
+	annos := map[string]string{
+		MachineConfigDaemonStateAnnotationKey: MachineConfigDaemonStateWorking,
+	}
+
+	newNode := node.DeepCopy()
+	if newNode.Annotations == nil {
+		newNode.Annotations = map[string]string{}
+	}
+
+	for k, v := range annos {
+		newNode.Annotations[k] = v
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, newNode, nil); err != nil {
+		return fmt.Errorf("failed to set node working for %s: %v", node.Name, err)
+	}
+	return nil
+}
+
+func setUpdatePodForNode(ctx context.Context, remoteClient client.Client, node *corev1.Node, targetConfigVersionHash string) error {
+	// TODO un-hardcode a lot of this
+	pod := &corev1.Pod{}
+	pod.APIVersion = corev1.SchemeGroupVersion.String()
+	pod.Kind = "Pod"
+	// Making this unique for now for debugging purposes
+	pod.Name = "machine-config-daemon-hypershift-" + node.Name + "-" + targetConfigVersionHash
+	pod.Namespace = "hypershift-mco"
+	pod.Spec.Containers = []corev1.Container{
+		{
+			Name:  "machine-config-daemon",
+			Image: "quay.io/jerzhang/hypershiftdaemon:latest",
+			Command: []string{
+				"/usr/bin/machine-config-daemon",
+			},
+			Args: []string{
+				"start",
+				"--node-name=" + node.Name,
+				"--root-mount=/rootfs",
+				"--kubeconfig=/var/lib/kubelet/kubeconfig",
+				"--desired-configmap=/etc/machine-config-daemon-desired-config",
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name: "POD_NAME",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.name",
+						},
+					},
+				},
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			SecurityContext: &corev1.SecurityContext{
+				Privileged: pointer.BoolPtr(true),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "rootfs",
+					MountPath: "/rootfs",
+				},
+				{
+					Name:      "desired-config-mount",
+					MountPath: "/rootfs/etc/machine-config-daemon-desired-config",
+				},
+			},
+		},
+	}
+	pod.Spec.HostNetwork = true
+	pod.Spec.HostPID = true
+	pod.Spec.ServiceAccountName = "machine-config-daemon-hypershift"
+	pod.Spec.Tolerations = []corev1.Toleration{
+		{
+			Operator: corev1.TolerationOpExists,
+		},
+	}
+	pod.Spec.NodeSelector = map[string]string{
+		"kubernetes.io/hostname": node.Name,
+	}
+	pod.Spec.Volumes = []corev1.Volume{
+		{
+			Name: "rootfs",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/",
+				},
+			},
+		},
+		{
+			Name: "desired-config-mount",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "desired-config",
+					},
+				},
+			},
+		},
+	}
+	pod.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, pod, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update pod: %v", err)
+	}
+
+	if err := setNodeWorking(ctx, remoteClient, node); err != nil {
+		return fmt.Errorf("failed to set node working annotation: %v", err)
+	}
+	return nil
+}
+
+func createInPlaceUpdateManifests(ctx context.Context, remoteClient client.Client, targetConfigVersionHash, ignEndpoint string, caCertBytes, tokenBytes []byte) error {
+	// TODO properly create the objects
+	// TODO use updated CreateOrUpdate func
+	// TODO un-hardcode objects
+	log := ctrl.LoggerFrom(ctx)
+
+	namespace := "hypershift-mco"
+	ns := &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Namespace",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, ns, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update namespace: %v", err)
+	}
+
+	saName := "machine-config-daemon-hypershift"
+	sa := &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ServiceAccount",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      saName,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, sa, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update serviceaccount: %v", err)
+	}
+
+	roleName := "machine-config-daemon-hypershift"
+	role := &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRole",
+			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      roleName,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+				Verbs:     []string{"get", "list", "watch", "patch", "update"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods/eviction"},
+				Verbs:     []string{"create"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"extensions"},
+				Resources: []string{"daemonsets"},
+				Verbs:     []string{"get"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"daemonsets"},
+				Verbs:     []string{"get"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"configmaps"},
+				Verbs:     []string{"get"},
+			},
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, role, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update clusterrole: %v", err)
+	}
+
+	binding := &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterRoleBinding",
+			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      roleName,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: namespace,
+			},
+		},
+	}
+
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, binding, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update clusterrolebinding: %v", err)
+	}
+
+	// fetch desired config off our ign endpoint and then stuff into configmap
+	// TODO reconsider this workflow
+	ignURL := fmt.Sprintf("https://%s/ignition", ignEndpoint)
+	req, err := http.NewRequest("GET", ignURL, nil)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to construct request")
+	}
+	req.Header.Add("Accept", "application/vnd.coreos.ignition+json;version=3.2.0, */*;q=0.1")
+	encodedToken := base64.StdEncoding.EncodeToString(tokenBytes)
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", encodedToken))
+	log.Info("Checking Authorization token",
+		"TEST", fmt.Sprintf("Bearer %s", encodedToken))
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCertBytes)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: caCertPool,
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to get desired config from MCS endpoint")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("request to the machine config server returned a bad status")
+	}
+	defer resp.Body.Close()
+
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// TODO the respData here needs to be parsed for a better workflow. For now just stuff it in
+	configmap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "desired-config",
+			Namespace: namespace,
+		},
+		Data: map[string]string{
+			"config": string(respData),
+			"hash":   targetConfigVersionHash,
+		},
+	}
+	if _, err := controllerutil.CreateOrPatch(ctx, remoteClient, configmap, nil); err != nil {
+		return fmt.Errorf("failed to reconcile update configmap: %v", err)
+	}
+
 	return nil
 }
 
@@ -195,7 +563,15 @@ func getNodesForNodePool(ctx context.Context, c client.Reader, remoteClient clie
 
 // TODO (alberto): implement.
 func inPlaceUpgradeComplete(nodes []*corev1.Node, targetVersionConfig string) bool {
-	return false
+	for _, node := range nodes {
+		// This is written by the MCD oneshot pod
+		if node.Annotations[CurrentMachineConfigAnnotationKey] != targetVersionConfig {
+			return false
+		}
+	}
+
+	// TODO remove pods/configmap/rbac/namespace etc.
+	return true
 }
 
 func targetRESTConfig(ctx context.Context, c client.Reader, hc *hyperv1.HostedCluster) (*restclient.Config, error) {

@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	api "github.com/openshift/hypershift/api"
@@ -17,8 +18,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/kubectl/pkg/drain"
 	k8sutilspointer "k8s.io/utils/pointer"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,7 +52,7 @@ const (
 	// DrainerStateUncordon is used for drainer annotation as a value to indicate needing an uncordon
 	DrainerStateUncordon = "uncordon"
 	// TODO (yuqi-zhang): implement drain
-	// DrainerStateDrain = "drain"
+	DrainerStateDrain = "drain"
 )
 
 // reconcileInPlaceUpgrade loops over all Nodes that belong to a NodePool and performs an in place upgrade if necessary.
@@ -150,7 +153,7 @@ func (r *NodePoolReconciler) reconcileInPlaceUpgrade(ctx context.Context, hc *hy
 	// TODO (jerzhang): consider what happens if the desiredConfig has changed since the node last upgraded
 	for _, node := range nodes {
 		if node.Annotations[DesiredDrainerAnnotationKey] != node.Annotations[LastAppliedDrainerAnnotationKey] {
-			if err = r.handleNodeDrainRequest(ctx, hostedClusterClient, node, node.Annotations[DesiredDrainerAnnotationKey]); err != nil {
+			if err = r.handleNodeDrainRequest(ctx, hc, nodePool, hostedClusterClient, node, node.Annotations[DesiredDrainerAnnotationKey]); err != nil {
 				return fmt.Errorf("failed to create upgrade manifests in hosted cluster: %w", err)
 			}
 			// TODO (jerzhang): in the future, consider exiting here and let future syncs handle post-drain functions
@@ -343,13 +346,64 @@ func getNodesToUpgrade(nodes []*corev1.Node, targetConfig string, maxUnavailable
 	return candidateNodes[:capacity]
 }
 
-func (r *NodePoolReconciler) handleNodeDrainRequest(ctx context.Context, hostedClusterClient client.Client, node *corev1.Node, desiredState string) error {
+func (r *NodePoolReconciler) handleNodeDrainRequest(ctx context.Context, hc *hyperv1.HostedCluster, nodePool *hyperv1.NodePool, hostedClusterClient client.Client, node *corev1.Node, desiredState string) error {
 	log := ctrl.LoggerFrom(ctx)
 
+	namespace := inPlaceUpgradeNamespace(nodePool)
+	daemonPodOnNode := inPlaceUpgradePod(namespace.Name, node.Name)
+	config, err := hostedClusterRESTConfig(ctx, r.Client, hc)
+	if err != nil {
+		return fmt.Errorf("drain failed on getting rest config: %w", err)
+	}
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("drain failed on creating kube client: %w", err)
+	}
+	drainer := &drain.Helper{
+		Client:              kubeClient,
+		Force:               true,
+		IgnoreAllDaemonSets: true,
+		DeleteEmptyDirData:  true,
+		GracePeriodSeconds:  -1,
+		Timeout:             90 * time.Second,
+		OnPodDeletedOrEvicted: func(pod *corev1.Pod, usingEviction bool) {
+			verbStr := "Deleted"
+			if usingEviction {
+				verbStr = "Evicted"
+			}
+			log.Info("Pod drained", "Action", verbStr, "Namespace", pod.Namespace, "Pod name", pod.Name)
+		},
+		AdditionalFilters: []drain.PodFilter{
+			func(pod corev1.Pod) drain.PodDeleteStatus {
+				if pod.Name == daemonPodOnNode.Name {
+					return drain.MakePodDeleteStatusSkip()
+				}
+				return drain.MakePodDeleteStatusOkay()
+			},
+		},
+		// TODO (jerzhang): properly handle errors
+		Out:    writer{log.Info},
+		ErrOut: writer{log.Info},
+		Ctx:    context.TODO(),
+	}
+
 	// TODO (jerzhang): delete the pod after we uncordon
-	// desiredVerb := strings.Split(desiredState, "-")[0]
-	// if desiredVerb == DrainerStateUncordon {
-	// }
+	desiredVerb := strings.Split(desiredState, "-")[0]
+	switch desiredVerb {
+	case DrainerStateUncordon:
+		log.Info("Performing uncordon on node", "name", node.Name)
+		// TODO (jerzhang) split this into a separate function
+		if err := drain.RunCordonOrUncordon(drainer, node, false); err != nil {
+			return fmt.Errorf("uncordon failed: %w", err)
+		}
+	case DrainerStateDrain:
+		log.Info("Performing drain on node", "name", node.Name)
+		if err := r.applyDrain(ctx, drainer, node); err != nil {
+			return fmt.Errorf("drain failed: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown drain verb in drain request %s: %s", desiredState, desiredVerb)
+	}
 
 	// TODO (jerzhang): actually implement the node draining. For now, just set the singal and pretend we drained.
 	annotations := map[string]string{
@@ -367,6 +421,39 @@ func (r *NodePoolReconciler) handleNodeDrainRequest(ctx context.Context, hostedC
 		log.Info("Reconciled Node drain annotations", "result", result)
 	}
 	return nil
+}
+
+func (r *NodePoolReconciler) applyDrain(ctx context.Context, drainer *drain.Helper, node *corev1.Node) error {
+	log := ctrl.LoggerFrom(ctx)
+	if err := drain.RunCordonOrUncordon(drainer, node, true); err != nil {
+		return fmt.Errorf("cordon failed: %w", err)
+	}
+	failedDrains := 0
+	for {
+		if err := drain.RunNodeDrain(drainer, node.Name); err != nil {
+			log.Info("Draining failed, retrying", "error", err)
+			failedDrains++
+			if failedDrains > 5 {
+				return fmt.Errorf("drain timed out", "error", err)
+			} else {
+				time.Sleep(1 * time.Minute)
+				continue
+			}
+		}
+		log.Info("Drain succeeded on node", "name", node.Name)
+		return nil
+	}
+}
+
+// writer implements io.Writer interface as a pass-through for log
+type writer struct {
+	logFunc func(arg string, args ...interface{})
+}
+
+// Write passes string(p) into writer's logFunc and always returns len(p)
+func (w writer) Write(p []byte) (n int, err error) {
+	w.logFunc(string(p))
+	return len(p), nil
 }
 
 func (r *NodePoolReconciler) reconcileNodeAnnotations(ctx context.Context, node *corev1.Node, annotations map[string]string) error {
